@@ -236,9 +236,17 @@ def parse_movie_info(data):
     return info
 
 
-def extract_format_event_codes(data):
-    """Extract format event codes from bottomSheetData if present."""
-    codes = []
+def discover_format_event_codes(data, target_lang="", target_format=""):
+    """
+    Extract format event codes from bottomSheetData.
+    Filters by language and format. If filtered list is empty,
+    safely falls back to returning all discovered formats to ensure
+    no tickets are missed due to naming discrepancies.
+    Returns: list of (event_code, language, format_name)
+    """
+    all_formats = []
+    filtered_formats = []
+
     bs = data.get("data", {}).get("bottomSheetData", {}).get("format-selector", {}).get("widgets", [])
     for w in bs:
         if w.get("type") == "chip-list":
@@ -246,9 +254,23 @@ def extract_format_event_codes(data):
                 cta = chip.get("cta", {})
                 addl = cta.get("additionalData", {})
                 ec = addl.get("eventCode")
-                if ec and ec not in codes:
-                    codes.append(ec)
-    return codes
+                lang = addl.get("language") or w.get("text", "")
+                title = chip.get("title", "")
+                fmt = cta.get("analytics", {}).get("format") or title
+                if ec and ec not in [x[0] for x in all_formats]:
+                    entry = (ec, lang, fmt)
+                    all_formats.append(entry)
+                    if matches_language(lang, target_lang) and matches_format(fmt, "", target_format):
+                        filtered_formats.append(entry)
+
+    if filtered_formats:
+        return filtered_formats
+    return all_formats
+
+
+def extract_format_event_codes(data):
+    """Backwards-compatible wrapper returning only event code strings."""
+    return [ec for ec, _, _ in discover_format_event_codes(data)]
 
 
 def parse_dates(data):
@@ -346,23 +368,31 @@ def matches_theatre(venue_name, filter_str):
 def matches_format(chip_title, screen_attr, format_filter):
     """
     Checks if a format chip title or show screen attribute matches the format filter.
-    Case-insensitive token intersection. Empty filter matches everything.
+    Case-insensitive token intersection with abbreviation normalization (e.g. vsn -> vision).
+    Empty filter matches everything.
     """
     if not format_filter:
         return True
 
-    haystack = f"{chip_title or ''} {screen_attr or ''}".lower()
-    haystack_clean = re.sub(r"[^\w\s]", " ", haystack)
-    h_words = set(haystack_clean.split())
+    def _norm(text):
+        t = (text or "").lower()
+        t = re.sub(r"\bvsn\b", "vision", t)
+        t = re.sub(r"\bvis\b", "vision", t)
+        t = re.sub(r"\b3-d\b", "3d", t)
+        t = re.sub(r"\b2-d\b", "2d", t)
+        return re.sub(r"[^\w\s]", " ", t)
+
+    haystack = _norm(f"{chip_title or ''} {screen_attr or ''}")
+    h_words = set(haystack.split())
 
     for kw in format_filter.split(","):
         kw = kw.strip().lower()
         if not kw:
             continue
-        if kw in haystack:
+        kw_norm = _norm(kw)
+        if kw_norm in haystack:
             return True
-        kw_clean = re.sub(r"[^\w\s]", " ", kw)
-        kw_words = set(kw_clean.split())
+        kw_words = set(kw_norm.split())
         if kw_words and kw_words.issubset(h_words):
             return True
     return False
@@ -469,43 +499,57 @@ def build_state(shows, dates):
     return {"shows": show_state, "dates": date_state}
 
 
-def detect_changes(old_state, new_state):
+def detect_dual_triggers(old_state, new_state, target_date=""):
+    """
+    Detects both date openings and ticket availability changes.
+    Prioritizes urgent alerts for target date.
+    """
     changes = []
 
-    # New dates opening
+    # 1. Date status transitions
     old_dates = old_state.get("dates", {})
     new_dates = new_state.get("dates", {})
     for dc, status in new_dates.items():
         old_status = old_dates.get(dc)
         if (old_status == "NOT_OPEN"
                 and status in ("BOOKABLE", "AVAILABLE")):
-            changes.append(f"📅 NEW DATE OPENED: {dc}")
+            prefix = "🚨 URGENT: " if (not target_date or dc == target_date) else ""
+            changes.append(f"{prefix}📅 DATE BOOKING OPENED: {dc}")
 
     old_shows = old_state.get("shows", {})
     new_shows = new_state.get("shows", {})
 
-    # New showtimes
+    # 2. New showtimes
     for key in set(new_shows) - set(old_shows):
         s = new_shows[key]
         lbl, ico = AVAIL_STATUS_MAP.get(s.get("status", ""), ("UNKNOWN", "⚪"))
+        is_target = (not target_date) or (s.get("date") == target_date)
+        prefix = "🚨 URGENT: " if is_target else ""
         changes.append(
-            f"🆕 NEW SHOW: {s['venue']} {s['time']} [{s['date']}] "
+            f"{prefix}🆕 NEW SHOW: {s['venue']} {s['time']} [{s['date']}] "
             f"— {s['cat']} ₹{s['price']} ({lbl})"
         )
 
-    # Sold out → available / status improvements
+    # 3. Sold out → available / status improvements
     for key, new_s in new_shows.items():
         old_s = old_shows.get(key)
         if old_s and old_s["status"] == "0" and new_s["status"] != "0":
             lbl, ico = AVAIL_STATUS_MAP.get(
                 new_s["status"], ("UNKNOWN", "⚪")
             )
+            is_target = (not target_date) or (new_s.get("date") == target_date)
+            prefix = "🚨 URGENT: " if is_target else ""
             changes.append(
-                f"{ico} TICKETS OPEN: {new_s['venue']} {new_s['time']} "
+                f"{prefix}{ico} TICKETS OPEN: {new_s['venue']} {new_s['time']} "
                 f"[{new_s['date']}] — {new_s['cat']} → {lbl}"
             )
 
     return changes
+
+
+def detect_changes(old_state, new_state):
+    """Backwards-compatible wrapper."""
+    return detect_dual_triggers(old_state, new_state, target_date=CONFIG.get("date", ""))
 
 
 # ──────────────────────────────────────────────────────────────────────
