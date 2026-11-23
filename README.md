@@ -1,69 +1,82 @@
-# BMS Ticket Notifier
+# BMS Ticket Notifier — Avengers Doomsday Tracker
 
-Automatically monitors [BookMyShow](https://in.bookmyshow.com) for ticket availability and sends you an email alert when something changes.
+Automatically monitors [BookMyShow](https://in.bookmyshow.com) for ticket availability and sends an urgent flood of emails and desktop alerts the instant ticket bookings open.
 
-Runs every n minutes via GitHub Actions. (You can set it via cron jobs, tho GH Actions doesn't kick in accurately)
+Configured by default to track **Avengers: Doomsday** for **December 21, 2026** at **PVR: VR Chennai, Anna Nagar** (English, PXL / MS-Infinity Vision).
 
-## How It Works
+Runs automatically every **5 minutes** for free via **GitHub Actions** cron.
 
-1. Fetches showtimes from the BookMyShow API for a given movie URL
-2. Compares results with the previous check (stored in `bms_state.json`)
-3. Sends an HTML email via [Resend](https://resend.com) if anything changed (new shows, dates opening, availability updates)
+---
 
-## Setup
+## Features
 
-### 1. Fork this repository
+- **Dual-Trigger Detection:**
+  - Monitors the BookMyShow date picker status (`NOT_OPEN` → `BOOKABLE` / `AVAILABLE` on Dec 21st).
+  - Monitors showtime listings and seat statuses (`SOLD OUT` → `AVAILABLE` / `FILLING FAST`).
+- **Dynamic Format Auto-Discovery:**
+  - Automatically queries BookMyShow's format-selector chips (e.g. `ET00526306` for MS-Infinity Vision 3D) so tickets aren't missed if published under variant child event codes.
+- **Resilient & Fuzzy Input Matching:**
+  - Tolerates theatre aliases (e.g. `VR Mall` or `PVR VR Mall` automatically matches `PVR: VR Chennai, Anna Nagar`).
+  - Normalizes abbreviations (e.g. `Vision` matches `Vsn`).
+  - Safe fallback: if a custom format filter matches no chips, automatically falls back to checking all formats instead of failing silently.
+- **Urgent Notification Flood:**
+  - Sends a configurable burst of high-urgency emails (default: 3 emails) with direct one-click **"BOOK TICKETS NOW"** links.
+  - Triggers local desktop notifications (`notify-send` on Linux / macOS banners) when run locally.
+- **Rate-Limiting Protection:**
+  - Employs realistic browser headers (`User-Agent`, `sec-ch-ua`, `x-app-code: WEB`).
+  - Applies randomized request jitter (0.5s–1.5s) and backoff handling to prevent IP bans.
 
-### 2. Set GitHub Secrets
+---
 
-Go to **Settings → Secrets and variables → Actions** and add:
+## Setup for GitHub Actions
 
-| Secret | Description |
-|--------|-------------|
-| `RESEND_API_KEY` | API key from [resend.com](https://resend.com) |
-| `RESEND_FROM_EMAIL` | Email address to send notifications (use your own domain email or anything@resend.dev) |
-| `RESEND_TO_EMAIL` | Email address to receive notifications |
+### 1. Fork or push this repository to GitHub
 
-### 3. Set GitHub Variables
+### 2. Set GitHub Secrets (For Email Alerts)
 
-Go to **Settings → Secrets and variables → Actions → Variables** and add:
+Go to **Settings → Secrets and variables → Actions → Secrets** and add:
 
-| Variable | Description | Example |
+| Secret | Description | Example |
+|--------|-------------|---------|
+| `RESEND_API_KEY` | API key from [resend.com](https://resend.com) | `re_123456789...` |
+| `RESEND_TO_EMAIL` | Email address where you want to receive alerts | `you@gmail.com` |
+| `RESEND_FROM_EMAIL` | Sender address (optional, defaults to `onboarding@resend.dev`) | `onboarding@resend.dev` |
+
+### 3. Set GitHub Variables (Optional — Defaults are already set for Dec 21 at VR Chennai)
+
+Go to **Settings → Secrets and variables → Actions → Variables** to override any parameters:
+
+| Variable | Description | Default |
 |----------|-------------|---------|
-| `BMS_URL` | BookMyShow ticket page URL | `https://in.bookmyshow.com/movies/chennai/.../ET00123456` |
-| `BMS_DATES` | Dates to monitor (YYYYMMDD, comma-separated). Leave empty to auto-detect from URL. | `20260318,20260319` |
-| `BMS_THEATRE` | Filter by theatre name (substring match, comma-separated) | `PVR,IMAX` |
-| `BMS_TIME` | Filter by time period (comma-separated) | `evening,night` |
+| `BMS_DATE` | Target date (YYYYMMDD) | `20261221` |
+| `BMS_THEATRE` | Theatre name or alias | `VR Chennai` |
+| `BMS_LANGUAGE` | Preferred language | `English` |
+| `BMS_FORMAT` | Preferred screen format | `PXL,MS-Infinity Vision` |
+| `BMS_LOCATION` | City name / region | `chennai` |
+| `BMS_MOVIE` | BMS movie slug | `avengers-doomsday` |
+| `ALERT_BURST` | Number of alert emails sent in rapid succession | `3` |
+| `BMS_TIME` | Optional time filter (`morning`, `afternoon`, `evening`, `night`) | *(all shows)* |
 
-**Time periods:** `morning` (6–12), `afternoon` (12–16), `evening` (16–19), `night` (19–24)
+### 4. Enable the Workflow
 
-### 4. Trigger the workflow
+Go to the **Actions** tab in your repository and ensure workflows are enabled. The checker runs automatically every 5 minutes. You can also click **Run workflow** anytime for a manual test.
 
-Go to **Actions → BMS Ticket Checker** and click **Run workflow**, or wait for it to run automatically every 30 minutes.
+---
 
 ## Local Usage
 
 Requires Python 3.14+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync --frozen
+# 1. Install dependencies
+uv sync
 
-export BMS_URL="https://in.bookmyshow.com/movies/chennai/.../ET00123456"
-export BMS_DATES="20260318,20260319"
-export BMS_THEATRE="PVR"
-export BMS_TIME="evening,night"
-export RESEND_API_KEY="re_..."
-export RESEND_TO_EMAIL="you@example.com"
-export RESEND_TO_EMAIL="python@resend.dev"
-
+# 2. Run the tracker
 uv run main.py
+
+# 3. Run the tracker with immediate status alert (dry-run / test notification)
+uv run main.py --notify-current
+
+# 4. Run the automated test suite
+uv run pytest
 ```
-
-## Notifications
-
-You'll receive an email when:
-- A new showtime is added
-- A date opens for booking
-- Seat availability changes (e.g. sold out → available)
-
-Emails show a summary of what changed and the current status of all monitored shows, grouped by theatre.
