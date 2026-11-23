@@ -1,6 +1,6 @@
 """
 BMS Ticket Checker — CI/Headless mode for GitHub Actions.
-Runs once, checks all configured watches, emails on changes.
+Runs once, checks all configured watches, emails/notifies on changes.
 State is persisted via a JSON artifact.
 
 Configure via environment variables or edit the CONFIG below.
@@ -10,6 +10,8 @@ import os
 import re
 import sys
 import json
+import shutil
+import subprocess
 from html import escape
 from datetime import datetime
 from dataclasses import dataclass, field
@@ -19,14 +21,48 @@ import requests
 # ──────────────────────────────────────────────────────────────────────
 # CONFIGURATION — edit these or set via env vars
 # ──────────────────────────────────────────────────────────────────────
+DEFAULT_LOCATION = "chennai"
+DEFAULT_MOVIE = "avengers-doomsday"
+DEFAULT_URL = (
+    "https://in.bookmyshow.com/movies/chennai/"
+    "avengers-doomsday-ms-infinity-vsn-3d/buytickets/ET00526306"
+)
+DEFAULT_DATES = "20261221"
+DEFAULT_THEATRE = "VR Chennai"
+DEFAULT_LANGUAGE = "English"
+DEFAULT_FORMAT = "PXL,MS-Infinity Vision"
+DEFAULT_ALERT_BURST = 3
+
+_theatre_env = os.getenv("BMS_THEATRE")
+if _theatre_env is None or not _theatre_env.strip():
+    _theatre_cfg = DEFAULT_THEATRE
+elif _theatre_env.strip().lower() in ("all", "*"):
+    _theatre_cfg = ""
+else:
+    _theatre_cfg = _theatre_env.strip()
+
+_dates_env = os.getenv("BMS_DATES") or os.getenv("BMS_DATE")
+_dates_cfg = _dates_env.strip() if (_dates_env is not None and _dates_env.strip()) else DEFAULT_DATES
+
+_url_env = os.getenv("BMS_URL")
+_url_cfg = _url_env.strip() if (_url_env is not None and _url_env.strip()) else DEFAULT_URL
+
+try:
+    _burst_cfg = int(os.getenv("ALERT_BURST", str(DEFAULT_ALERT_BURST)))
+except ValueError:
+    _burst_cfg = DEFAULT_ALERT_BURST
+
 CONFIG = {
-    "url": os.getenv(
-        "BMS_URL",
-        "https://in.bookmyshow.com/movies/chennai/dhurandhar-the-revenge/buytickets/ET00478890"
-    ),
-    "dates": os.getenv("BMS_DATES", ""),          # comma-separated YYYYMMDD, empty = from URL
-    "theatre": os.getenv("BMS_THEATRE", ""),       # substring filter, empty = all
-    "time_period": os.getenv("BMS_TIME", ""),      # e.g. "evening,night", empty = all
+    "location": (os.getenv("BMS_LOCATION") or DEFAULT_LOCATION).strip().lower(),
+    "movie": (os.getenv("BMS_MOVIE") or DEFAULT_MOVIE).strip(),
+    "theatre": _theatre_cfg,
+    "date": _dates_cfg,
+    "dates": _dates_cfg,  # backwards compatibility
+    "language": (os.getenv("BMS_LANGUAGE") or DEFAULT_LANGUAGE).strip(),
+    "format": (os.getenv("BMS_FORMAT") or DEFAULT_FORMAT).strip(),
+    "time_period": (os.getenv("BMS_TIME") or "").strip(),
+    "alert_burst": _burst_cfg,
+    "url": _url_cfg,
 }
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
@@ -72,7 +108,7 @@ REGION_MAP = {
 }
 
 
-# ─────────────────────────────────────���────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────
 # DATA
 # ──────────────────────────────────────────────────────────────────────
 @dataclass
@@ -200,6 +236,21 @@ def parse_movie_info(data):
     return info
 
 
+def extract_format_event_codes(data):
+    """Extract format event codes from bottomSheetData if present."""
+    codes = []
+    bs = data.get("data", {}).get("bottomSheetData", {}).get("format-selector", {}).get("widgets", [])
+    for w in bs:
+        if w.get("type") == "chip-list":
+            for chip in w.get("data", []):
+                cta = chip.get("cta", {})
+                addl = cta.get("additionalData", {})
+                ec = addl.get("eventCode")
+                if ec and ec not in codes:
+                    codes.append(ec)
+    return codes
+
+
 def parse_dates(data):
     dates = []
     for w in data.get("data", {}).get("topStickyWidgets", []):
@@ -253,7 +304,6 @@ def parse_shows(data):
                     )
                     for cat in sa.get("categories", []):
                         ca = str(cat.get("availStatus", ""))
-                        lbl, _ = AVAIL_STATUS_MAP.get(ca, ("UNKNOWN", ""))
                         show.categories.append(CatInfo(
                             name=cat.get("priceDesc", ""),
                             price=cat.get("curPrice", "0"),
@@ -266,21 +316,96 @@ def parse_shows(data):
 # ──────────────────────────────────────────────────────────────────────
 # FILTERING
 # ──────────────────────────────────────────────────────────────────────
+def matches_theatre(venue_name, filter_str):
+    """
+    Flexible theatre name matching.
+    Supports substring match as well as alias/token match (e.g. 'VR Mall'
+    matches 'PVR: VR Chennai, Anna Nagar' by ignoring generic words).
+    """
+    if not filter_str:
+        return True
+    v_clean = re.sub(r"[^\w\s]", " ", venue_name.lower())
+    v_words = set(v_clean.split())
+    v_lower = venue_name.lower()
+
+    for kw in filter_str.split(","):
+        kw = kw.strip().lower()
+        if not kw:
+            continue
+        if kw in v_lower:
+            return True
+        kw_clean = re.sub(r"[^\w\s]", " ", kw)
+        kw_words = set(kw_clean.split())
+        generic = {"mall", "cinema", "cinemas", "theatre", "theater", "multiplex"}
+        core_words = kw_words - generic
+        if core_words and core_words.issubset(v_words):
+            return True
+    return False
+
+
+def matches_format(chip_title, screen_attr, format_filter):
+    """
+    Checks if a format chip title or show screen attribute matches the format filter.
+    Case-insensitive token intersection. Empty filter matches everything.
+    """
+    if not format_filter:
+        return True
+
+    haystack = f"{chip_title or ''} {screen_attr or ''}".lower()
+    haystack_clean = re.sub(r"[^\w\s]", " ", haystack)
+    h_words = set(haystack_clean.split())
+
+    for kw in format_filter.split(","):
+        kw = kw.strip().lower()
+        if not kw:
+            continue
+        if kw in haystack:
+            return True
+        kw_clean = re.sub(r"[^\w\s]", " ", kw)
+        kw_words = set(kw_clean.split())
+        if kw_words and kw_words.issubset(h_words):
+            return True
+    return False
+
+
+def matches_language(chip_lang, lang_filter):
+    """
+    Case-insensitive match for language. Empty filter matches everything.
+    """
+    if not lang_filter:
+        return True
+    if not chip_lang:
+        return False
+    cl = chip_lang.strip().lower()
+    for lf in lang_filter.split(","):
+        lf = lf.strip().lower()
+        if not lf:
+            continue
+        if lf in cl or cl.startswith(lf):
+            return True
+    return False
+
+
 def filter_shows(shows, theatre_filter, time_periods, date_codes):
     result = []
-    kws = [k.strip().lower() for k in theatre_filter.split(",")
-           if k.strip()] if theatre_filter else []
     periods = [p.strip().lower() for p in time_periods.split(",")
                if p.strip()] if time_periods else []
     dates_set = set(d.strip() for d in date_codes.split(",")
                     if d.strip()) if date_codes else set()
 
+    seen_session_keys = set()
+
     for s in shows:
+        # Avoid duplicate sessions if aggregated across multiple formats
+        s_key = (s.venue_code, s.session_id, s.date_code)
+        if s.session_id and s_key in seen_session_keys:
+            continue
+        if s.session_id:
+            seen_session_keys.add(s_key)
+
         # Theatre filter
-        if kws:
-            name_lower = s.venue_name.lower()
-            if not any(k in name_lower for k in kws):
-                continue
+        if theatre_filter and not matches_theatre(s.venue_name, theatre_filter):
+            continue
 
         # Date filter
         if dates_set and s.date_code and s.date_code not in dates_set:
@@ -362,12 +487,13 @@ def detect_changes(old_state, new_state):
     # New showtimes
     for key in set(new_shows) - set(old_shows):
         s = new_shows[key]
+        lbl, ico = AVAIL_STATUS_MAP.get(s.get("status", ""), ("UNKNOWN", "⚪"))
         changes.append(
-            f"🆕 NEW: {s['venue']} {s['time']} [{s['date']}] "
-            f"— {s['cat']} ₹{s['price']}"
+            f"🆕 NEW SHOW: {s['venue']} {s['time']} [{s['date']}] "
+            f"— {s['cat']} ₹{s['price']} ({lbl})"
         )
 
-    # Sold out → available
+    # Sold out → available / status improvements
     for key, new_s in new_shows.items():
         old_s = old_shows.get(key)
         if old_s and old_s["status"] == "0" and new_s["status"] != "0":
@@ -375,7 +501,7 @@ def detect_changes(old_state, new_state):
                 new_s["status"], ("UNKNOWN", "⚪")
             )
             changes.append(
-                f"{ico} BACK: {new_s['venue']} {new_s['time']} "
+                f"{ico} TICKETS OPEN: {new_s['venue']} {new_s['time']} "
                 f"[{new_s['date']}] — {new_s['cat']} → {lbl}"
             )
 
@@ -383,10 +509,26 @@ def detect_changes(old_state, new_state):
 
 
 # ──────────────────────────────────────────────────────────────────────
-# EMAIL NOTIFICATION (Resend)
+# NOTIFICATIONS (Email via Resend & Local Desktop)
 # ──────────────────────────────────────────────────────────────────────
 def _cat_status_label(status):
     return AVAIL_STATUS_MAP.get(status, ("UNKNOWN", ""))[0]
+
+
+def send_desktop_notification(title, message):
+    """Send local desktop notification if on Linux or macOS."""
+    try:
+        if shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, message], check=False)
+        elif sys.platform == "darwin":
+            escaped_msg = message.replace('"', '\\"')
+            escaped_title = title.replace('"', '\\"')
+            subprocess.run([
+                "osascript", "-e",
+                f'display notification "{escaped_msg}" with title "{escaped_title}"'
+            ], check=False)
+    except Exception as e:
+        print(f"  ⚠️ Desktop notification failed: {e}")
 
 
 def send_email(subject, changes, shows, movie_info):
@@ -478,7 +620,6 @@ def send_email(subject, changes, shows, movie_info):
 </body>
 </html>"""
 
-    # Build plain-text version with full show details
     plain_lines = [subject, "", f"Checked at: {now_str}", ""]
     if changes:
         plain_lines.append("Changes Detected:")
@@ -521,6 +662,13 @@ def send_email(subject, changes, shows, movie_info):
         sys.exit(1)
 
 
+def send_notifications(subject, changes, shows, movie_info):
+    """Dispatch both desktop notification and email alert."""
+    summary = "\n".join(changes[:4]) if changes else f"Current shows found: {len(shows)}"
+    send_desktop_notification(f"BMS: {movie_info.get('name', 'Movie')}", summary)
+    send_email(subject, changes, shows, movie_info)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────
@@ -528,7 +676,6 @@ def main():
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now_str}] BMS Ticket Checker — CI mode")
 
-    # Parse config
     parsed = parse_bms_url(CONFIG["url"])
     event_code = parsed["event_code"]
     region_slug = parsed["region_slug"]
@@ -542,7 +689,6 @@ def main():
         region_slug
     )
 
-    # Determine dates to check
     raw_dates = CONFIG["dates"].strip()
     if raw_dates:
         date_list = [d.strip() for d in raw_dates.split(",") if d.strip()]
@@ -554,7 +700,6 @@ def main():
     print(f"  Event: {event_code}  Region: {region_code}  "
           f"Dates: {date_list}")
 
-    # Fetch data for each date
     all_shows = []
     all_dates = []
     movie_info = {"name": "Unknown", "language": ""}
@@ -570,7 +715,26 @@ def main():
             movie_info = parse_movie_info(data)
 
         all_dates.extend(parse_dates(data))
-        all_shows.extend(parse_shows(data))
+        parsed_shows = parse_shows(data)
+
+        # Multi-format fallback: If zero shows returned for base event code,
+        # query linked format event codes found in bottomSheetData.
+        if not parsed_shows:
+            format_codes = extract_format_event_codes(data)
+            if format_codes:
+                print(f"  ℹ️  Checking {len(format_codes)} linked formats for shows...")
+                for fmt_code in format_codes:
+                    if fmt_code == event_code:
+                        continue
+                    fmt_data = fetch_bms(fmt_code, dc, region_code,
+                                         region_slug_r, lat, lon, geohash)
+                    if fmt_data:
+                        fmt_shows = parse_shows(fmt_data)
+                        if fmt_shows:
+                            parsed_shows.extend(fmt_shows)
+                            print(f"     Format {fmt_code} provided {len(fmt_shows)} show(s)")
+
+        all_shows.extend(parsed_shows)
 
     if not all_shows:
         print("  ❌ No showtimes found.")
@@ -585,25 +749,38 @@ def main():
         CONFIG["time_period"],
         CONFIG["dates"],
     )
-    print(f"  📊 {len(filtered)} showtime(s) after filters")
+    print(f"  📊 {len(filtered)} showtime(s) matching filter '{CONFIG['theatre']}' on {CONFIG['dates']}")
 
     # Build state & detect changes
     new_state = build_state(filtered, all_dates)
     old_state = load_state()
 
     changes = []
+    is_initial_run = not bool(old_state)
+
     if old_state:
         changes = detect_changes(old_state, new_state)
 
     save_state(new_state)
 
+    notify_requested = "--notify-current" in sys.argv or "--notify" in sys.argv
+
     if changes:
         print(f"\n  ⚡ {len(changes)} change(s) detected:")
         for c in changes:
             print(f"     {c}")
-        send_email(
+        send_notifications(
             f"BMS Alert: {movie_info['name']} - {len(changes)} change(s)",
             changes, filtered, movie_info,
+        )
+    elif is_initial_run or notify_requested:
+        summary_msg = f"Watching {len(filtered)} show(s) at {CONFIG['theatre']} for {CONFIG['dates']}"
+        print(f"\n  ℹ️  {summary_msg}")
+        # Notify current status
+        send_notifications(
+            f"BMS Alert: {movie_info['name']} - Monitoring Active",
+            [f"Watch active for {CONFIG['theatre']} on {CONFIG['dates']}: {len(filtered)} show(s) monitored."],
+            filtered, movie_info,
         )
     else:
         print("  ✅ No changes since last check.")
