@@ -10,6 +10,8 @@ import os
 import re
 import sys
 import json
+import time
+import random
 import shutil
 import subprocess
 from html import escape
@@ -167,6 +169,13 @@ API_URL = (
     "https://in.bookmyshow.com/api/movies-data/v4/"
     "showtimes-by-event/primary-dynamic"
 )
+
+
+def apply_request_jitter(min_sec: float = 0.5, max_sec: float = 1.5):
+    """Adds a small randomized sleep interval to avoid triggering edge rate limits."""
+    delay = random.uniform(min_sec, max_sec)
+    time.sleep(delay)
+    return delay
 
 
 def fetch_bms(event_code, date_code, region_code, region_slug,
@@ -575,28 +584,46 @@ def send_desktop_notification(title, message):
         print(f"  ⚠️ Desktop notification failed: {e}")
 
 
-def send_email(subject, changes, shows, movie_info):
-    api_key = RESEND_API_KEY.strip()
-    to = RESEND_TO_EMAIL.strip()
-    frm = RESEND_FROM_EMAIL.strip() or "onboarding@resend.dev"
-
-    if not api_key or not to:
-        print("  ⚠️  Skipping email — RESEND_API_KEY or RESEND_TO_EMAIL not set.")
-        return
-
+def build_alert_content(changes, shows, movie_info, booking_url=""):
+    """
+    Builds subject, plain text, and HTML formatted email with direct booking CTA.
+    """
     now_str = datetime.now().strftime("%d %b %Y, %I:%M %p")
     movie_name = movie_info.get("name", "Movie")
+    is_urgent = any("🚨 URGENT" in c for c in changes)
+
+    if is_urgent:
+        subject = f"🚨 URGENT: {movie_name.upper()} TICKETS OPEN - BOOK NOW!"
+    elif changes:
+        subject = f"BMS Alert: {movie_name} - {len(changes)} change(s)"
+    else:
+        subject = f"BMS Alert: {movie_name} - Monitoring Active"
+
+    # Direct booking CTA button
+    cta_html = ""
+    if booking_url:
+        cta_html = f"""
+        <div style="margin:20px 0;text-align:center;">
+            <a href="{booking_url}" target="_blank"
+               style="background-color:#e50914;color:#ffffff;padding:14px 28px;
+                      font-size:16px;font-weight:bold;text-decoration:none;
+                      border-radius:6px;display:inline-block;">
+                🎟️ BOOK TICKETS NOW
+            </a>
+        </div>"""
 
     # Build changes HTML
     changes_html = ""
     if changes:
         rows = "".join(
-            f'<li style="padding:3px 0;font-size:14px;">{escape(c)}</li>'
+            f'<li style="padding:4px 0;font-size:14px;color:#d32f2f;">{escape(c)}</li>'
+            if "URGENT" in c else
+            f'<li style="padding:3px 0;font-size:14px;color:#333;">{escape(c)}</li>'
             for c in changes
         )
         changes_html = f"""
-        <h3 style="margin:0 0 8px 0;font-size:15px;font-weight:bold;color:#333;">
-            Changes Detected
+        <h3 style="margin:0 0 8px 0;font-size:16px;font-weight:bold;color:#111;">
+            ⚡ Changes Detected
         </h3>
         <ul style="margin:0 0 20px 0;padding-left:20px;line-height:1.6;color:#333;">
             {rows}
@@ -618,11 +645,9 @@ def send_email(subject, changes, shows, movie_info):
             fmt = f" [{escape(s.screen_attr)}]" if s.screen_attr else ""
             show_rows += (
                 f'<tr>'
-                f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;'
-                f'font-size:13px;vertical-align:top;">'
+                f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;font-size:13px;vertical-align:top;">'
                 f'{escape(s.time)}{fmt}</td>'
-                f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;'
-                f'font-size:13px;vertical-align:top;">'
+                f'<td style="padding:5px 8px;border-bottom:1px solid #ddd;font-size:13px;vertical-align:top;">'
                 f'{cats}</td>'
                 f'</tr>'
             )
@@ -633,10 +658,8 @@ def send_email(subject, changes, shows, movie_info):
         </p>
         <table style="width:100%;border-collapse:collapse;font-size:13px;">
             <tr style="background:#f5f5f5;">
-                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #ddd;
-                           font-weight:bold;">Time</th>
-                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #ddd;
-                           font-weight:bold;">Categories</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #ddd;font-weight:bold;">Time</th>
+                <th style="padding:5px 8px;text-align:left;border-bottom:1px solid #ddd;font-weight:bold;">Categories</th>
             </tr>
             {show_rows}
         </table>"""
@@ -644,20 +667,21 @@ def send_email(subject, changes, shows, movie_info):
     html = f"""<!doctype html>
 <html>
 <head><meta charset="utf-8"></head>
-<body style="margin:0;padding:24px;font-family:Arial,Helvetica,sans-serif;
-             font-size:14px;color:#333;background:#fff;">
-    <h2 style="margin:0 0 4px 0;font-size:18px;color:#111;">
-        BMS Alert: {escape(movie_name)}
+<body style="margin:0;padding:24px;font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#333;background:#fff;">
+    <h2 style="margin:0 0 4px 0;font-size:20px;color:#111;">
+        {escape(movie_name)} — Ticket Alert
     </h2>
-    <p style="margin:0 0 20px 0;font-size:13px;color:#666;">
+    <p style="margin:0 0 16px 0;font-size:13px;color:#666;">
         {escape(now_str)}
     </p>
+    {cta_html}
     <hr style="border:none;border-top:1px solid #ddd;margin:0 0 20px 0;">
     {changes_html}
     <h3 style="margin:0 0 8px 0;font-size:15px;font-weight:bold;color:#333;">
         Current Showtimes
     </h3>
     {shows_html}
+    {cta_html}
     <p style="margin:24px 0 0 0;font-size:12px;color:#999;">
         This is an automated alert from BMS Ticket Notifier.
     </p>
@@ -665,6 +689,8 @@ def send_email(subject, changes, shows, movie_info):
 </html>"""
 
     plain_lines = [subject, "", f"Checked at: {now_str}", ""]
+    if booking_url:
+        plain_lines.extend(["BOOK TICKETS NOW:", booking_url, ""])
     if changes:
         plain_lines.append("Changes Detected:")
         plain_lines.extend(f"  - {c}" for c in changes)
@@ -682,6 +708,19 @@ def send_email(subject, changes, shows, movie_info):
     plain_lines.extend(["", "This is an automated alert from BMS Ticket Notifier."])
     plain = "\n".join(plain_lines)
 
+    return subject, plain, html
+
+
+def send_email_single(subject, plain, html):
+    """Sends a single email via Resend API."""
+    api_key = RESEND_API_KEY.strip()
+    to = RESEND_TO_EMAIL.strip()
+    frm = RESEND_FROM_EMAIL.strip() or "onboarding@resend.dev"
+
+    if not api_key or not to:
+        print("  ⚠️  Skipping email — RESEND_API_KEY or RESEND_TO_EMAIL not set.")
+        return False
+
     try:
         resp = requests.post(
             "https://api.resend.com/emails",
@@ -698,19 +737,47 @@ def send_email(subject, changes, shows, movie_info):
         )
         if resp.status_code in (200, 201):
             print(f"  ✅ Email sent to {to}")
+            return True
         else:
             print(f"  ❌ Resend {resp.status_code}: {resp.text}")
-            sys.exit(1)
+            return False
     except requests.RequestException as e:
         print(f"  ❌ Email failed: {e}")
-        sys.exit(1)
+        return False
+
+
+def send_urgent_alert(changes, shows, movie_info, booking_url="", burst_count=1):
+    """
+    Sends an immediate desktop alert and an urgent burst of emails to ensure
+    the user is alerted without exceeding daily limits.
+    """
+    summary = "\n".join(changes[:4]) if changes else f"Current shows found: {len(shows)}"
+    send_desktop_notification(f"🚨 BMS: {movie_info.get('name', 'Movie')}", summary)
+
+    subject, plain, html = build_alert_content(changes, shows, movie_info, booking_url)
+
+    sent = 0
+    count = max(1, burst_count)
+    for i in range(count):
+        if i > 0:
+            time.sleep(1.0)
+        success = send_email_single(subject, plain, html)
+        if success:
+            sent += 1
+    return sent
+
+
+def send_email(subject, changes, shows, movie_info):
+    """Backwards-compatible wrapper."""
+    _, plain, html = build_alert_content(changes, shows, movie_info, CONFIG.get("url", ""))
+    send_email_single(subject, plain, html)
 
 
 def send_notifications(subject, changes, shows, movie_info):
-    """Dispatch both desktop notification and email alert."""
-    summary = "\n".join(changes[:4]) if changes else f"Current shows found: {len(shows)}"
-    send_desktop_notification(f"BMS: {movie_info.get('name', 'Movie')}", summary)
-    send_email(subject, changes, shows, movie_info)
+    """Dispatch alert handling."""
+    is_urgent = any("🚨 URGENT" in c for c in changes)
+    burst = CONFIG.get("alert_burst", 1) if is_urgent else 1
+    send_urgent_alert(changes, shows, movie_info, booking_url=CONFIG.get("url", ""), burst_count=burst)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -780,20 +847,14 @@ def main():
 
         all_shows.extend(parsed_shows)
 
-    if not all_shows:
-        print("  ❌ No showtimes found.")
-        sys.exit(0)
-
-    print(f"  🎬 {movie_info['name']}  {movie_info['language']}")
-
     # Apply filters
     filtered = filter_shows(
         all_shows,
         CONFIG["theatre"],
         CONFIG["time_period"],
-        CONFIG["dates"],
+        CONFIG["date"],
     )
-    print(f"  📊 {len(filtered)} showtime(s) matching filter '{CONFIG['theatre']}' on {CONFIG['dates']}")
+    print(f"  📊 {len(filtered)} showtime(s) matching filter '{CONFIG['theatre']}' on {CONFIG['date']}")
 
     # Build state & detect changes
     new_state = build_state(filtered, all_dates)
@@ -803,7 +864,7 @@ def main():
     is_initial_run = not bool(old_state)
 
     if old_state:
-        changes = detect_changes(old_state, new_state)
+        changes = detect_dual_triggers(old_state, new_state, target_date=CONFIG["date"])
 
     save_state(new_state)
 
@@ -818,12 +879,11 @@ def main():
             changes, filtered, movie_info,
         )
     elif is_initial_run or notify_requested:
-        summary_msg = f"Watching {len(filtered)} show(s) at {CONFIG['theatre']} for {CONFIG['dates']}"
+        summary_msg = f"Watching {len(filtered)} show(s) at {CONFIG['theatre']} for {CONFIG['date']}"
         print(f"\n  ℹ️  {summary_msg}")
-        # Notify current status
         send_notifications(
             f"BMS Alert: {movie_info['name']} - Monitoring Active",
-            [f"Watch active for {CONFIG['theatre']} on {CONFIG['dates']}: {len(filtered)} show(s) monitored."],
+            [f"Watch active for {CONFIG['theatre']} on {CONFIG['date']}: {len(filtered)} show(s) monitored."],
             filtered, movie_info,
         )
     else:
