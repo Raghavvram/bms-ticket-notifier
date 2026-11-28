@@ -14,11 +14,34 @@ import time
 import random
 import shutil
 import subprocess
+from pathlib import Path
 from html import escape
 from datetime import datetime
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 import requests
+
+
+def load_env_file(env_path=None):
+    """Load key=value pairs from a .env file without overwriting existing env vars."""
+    path = Path(env_path) if env_path is not None else Path(__file__).resolve().parent / ".env"
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+load_env_file()
 
 # ──────────────────────────────────────────────────────────────────────
 # CONFIGURATION — edit these or set via env vars
@@ -27,7 +50,7 @@ DEFAULT_LOCATION = "chennai"
 DEFAULT_MOVIE = "avengers-doomsday"
 DEFAULT_URL = (
     "https://in.bookmyshow.com/movies/chennai/"
-    "avengers-doomsday-ms-infinity-vsn-3d/buytickets/ET00526306"
+    "avengers-doomsday-ms-infinity-vsn/buytickets/ET00526306"
 )
 DEFAULT_DATES = "20261221"
 DEFAULT_THEATRE = "VR Chennai"
@@ -280,6 +303,21 @@ def discover_format_event_codes(data, target_lang="", target_format=""):
 def extract_format_event_codes(data):
     """Backwards-compatible wrapper returning only event code strings."""
     return [ec for ec, _, _ in discover_format_event_codes(data)]
+
+
+def should_fallback_to_other_formats(data, event_code):
+    """
+    Only fall back to linked format event codes if the requested event_code
+    is disabled (e.g. parent listing) or not present as an active format chip.
+    """
+    bs = data.get("data", {}).get("bottomSheetData", {}).get("format-selector", {}).get("widgets", [])
+    for w in bs:
+        if w.get("type") == "chip-list":
+            for chip in w.get("data", []):
+                addl = chip.get("cta", {}).get("additionalData", {})
+                if addl.get("eventCode") == event_code:
+                    return bool(addl.get("isDisabled", False))
+    return True
 
 
 def parse_dates(data):
@@ -828,10 +866,13 @@ def main():
         all_dates.extend(parse_dates(data))
         parsed_shows = parse_shows(data)
 
-        # Multi-format fallback: If zero shows returned for base event code,
-        # query linked format event codes found in bottomSheetData.
-        if not parsed_shows:
-            format_codes = extract_format_event_codes(data)
+        # Multi-format fallback: Only query linked format event codes when the
+        # requested event_code is disabled/base listing rather than a specific format.
+        if not parsed_shows and should_fallback_to_other_formats(data, event_code):
+            format_entries = discover_format_event_codes(
+                data, CONFIG.get("language", ""), CONFIG.get("format", "")
+            )
+            format_codes = [ec for ec, _, _ in format_entries]
             if format_codes:
                 print(f"  ℹ️  Checking {len(format_codes)} linked formats for shows...")
                 for fmt_code in format_codes:

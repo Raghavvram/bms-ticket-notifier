@@ -1,5 +1,5 @@
 import pytest
-from main import discover_format_event_codes, detect_dual_triggers
+from main import discover_format_event_codes, detect_dual_triggers, should_fallback_to_other_formats
 
 SAMPLE_BMS_DATA = {
     "data": {
@@ -105,3 +105,41 @@ def test_detect_dual_triggers_tickets_available():
     triggers = detect_dual_triggers(old_state, new_state, target_date="20261221")
     assert any("TICKETS OPEN" in t for t in triggers)
     assert any("AVAILABLE" in t for t in triggers)
+
+
+def test_should_fallback_only_for_disabled_or_base_event():
+    data_with_disabled = {
+        "data": {
+            "bottomSheetData": {
+                "format-selector": {
+                    "widgets": [
+                        {
+                            "type": "chip-list",
+                            "text": "English",
+                            "data": [
+                                {
+                                    "title": "2D",
+                                    "cta": {
+                                        "additionalData": {
+                                            "eventCode": "ET00439706",
+                                            "isDisabled": True,
+                                        }
+                                    },
+                                },
+                                {
+                                    "title": "MS-Infinity Vsn 3d",
+                                    "cta": {
+                                        "additionalData": {
+                                            "eventCode": "ET00526306",
+                                        }
+                                    },
+                                },
+                            ],
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    assert should_fallback_to_other_formats(data_with_disabled, "ET00439706") is True
+    assert should_fallback_to_other_formats(data_with_disabled, "ET00526306") is False

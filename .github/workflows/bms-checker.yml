@@ -38,7 +38,7 @@ jobs:
           BMS_LANGUAGE: ${{ vars.BMS_LANGUAGE || 'English' }}
           BMS_FORMAT: ${{ vars.BMS_FORMAT || 'PXL,MS-Infinity Vision' }}
           ALERT_BURST: ${{ vars.ALERT_BURST || '3' }}
-          BMS_URL: ${{ vars.BMS_URL || 'https://in.bookmyshow.com/movies/chennai/avengers-doomsday-ms-infinity-vsn-3d/buytickets/ET00526306' }}
+          BMS_URL: ${{ vars.BMS_URL || 'https://in.bookmyshow.com/movies/chennai/avengers-doomsday-ms-infinity-vsn/buytickets/ET00526306' }}
           BMS_TIME: ${{ vars.BMS_TIME }}
         run: uv run main.py
 
