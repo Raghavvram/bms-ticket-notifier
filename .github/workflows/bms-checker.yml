@@ -2,7 +2,7 @@ name: BMS Ticket Checker
 
 on:
   schedule:
-    # Run every 5 minutes automatically for free via GitHub Actions
+    # Run every 30 minutes automatically for free via GitHub Actions
     - cron: '*/30 * * * *'
   workflow_dispatch:  # Manual trigger button
 
